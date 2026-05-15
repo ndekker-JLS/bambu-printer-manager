@@ -24,15 +24,49 @@ SOFTWARE.
 wrapper for FTPS server interactions
 """
 
+import dataclasses
+import datetime
 import ftplib
+import io
+import logging
 import os
+import re
 import socket
 import ssl
-from typing import Optional, Union
 
-from contextlib import redirect_stdout
-import io
-import re
+logger = logging.getLogger(__name__)
+
+
+FTP_LIST_PATTERN = re.compile(
+    r"(?P<directory>[d-])(?P<permissions>(?:[r-][w-][x-]){3})\s+\d+\s+(?P<owner>\w+)\s+(?P<group>\w+)\s+(?P<size>\d+)\s+(?:(?P<date>(?P<month>\w{3})\s+(?P<day>\d{2}))\s+(?:(?P<year>\d{4})|(?P<time>(?P<hour>\d{2}):(?P<minute>\d{2}))))\s+(?P<name>.*)"
+)
+MONTH_LOOKUP = {
+    "Jan": 1,
+    "Feb": 2,
+    "Mar": 3,
+    "Apr": 4,
+    "May": 5,
+    "Jun": 6,
+    "Jul": 7,
+    "Aug": 8,
+    "Sep": 9,
+    "Oct": 10,
+    "Nov": 11,
+    "Dec": 12,
+}
+
+
+@dataclasses.dataclass
+class FtpListItem:
+    path: str
+    name: str
+    size: int
+    is_dir: bool
+    timestamp: datetime.datetime
+    owner: str
+    group: str
+    permissions: str
+
 
 class ImplicitTLS(ftplib.FTP_TLS):
     """ftplib.FTP_TLS sub-class to support implicit SSL FTPS"""
@@ -57,9 +91,9 @@ class ImplicitTLS(ftplib.FTP_TLS):
         conn, size = ftplib.FTP.ntransfercmd(self, cmd, rest)
 
         if self._prot_p:
-            conn = self.context.wrap_socket(conn,
-                                            server_hostname=self.host,
-                                            session=self.sock.session)  # this is the fix
+            conn = self.context.wrap_socket(
+                conn, server_hostname=self.host, session=self.sock.session
+            )  # this is the fix
         return conn, size
 
 
@@ -71,17 +105,17 @@ class IoTFTPSClient:
     ftps_user: str
     ftps_pass: str
     ssl_implicit: bool
-    ftps_session: Union[ftplib.FTP, ImplicitTLS]
-    last_error: Optional[str] = None
+    ftps_session: ftplib.FTP | ImplicitTLS
+    last_error: str | None = None
     welcome: str
 
     def __init__(
-            self,
-            ftps_host: str,
-            ftps_port: Optional[int] = 21,
-            ftps_user: Optional[str] = "",
-            ftps_pass: Optional[str] = "",
-            ssl_implicit: Optional[bool] = False,
+        self,
+        ftps_host: str,
+        ftps_port: int | None = 21,
+        ftps_user: str | None = "",
+        ftps_pass: str | None = "",
+        ssl_implicit: bool | None = False,
     ) -> None:
         self.ftps_host = ftps_host
         self.ftps_port = ftps_port
@@ -106,7 +140,8 @@ class IoTFTPSClient:
         self.ftps_session.set_debuglevel(0)
 
         self.welcome = self.ftps_session.connect(
-            host=self.ftps_host, port=self.ftps_port)
+            host=self.ftps_host, port=self.ftps_port
+        )
 
         if self.ftps_user and self.ftps_pass:
             self.ftps_session.login(user=self.ftps_user, passwd=self.ftps_pass)
@@ -136,7 +171,7 @@ class IoTFTPSClient:
         # Taken from ftplib.storbinary but with custom ssl handling
         # due to the shitty bambu p1p ftps server TODO fix properly.
         with open(source, "rb") as fp:
-            self.ftps_session.voidcmd('TYPE I')
+            self.ftps_session.voidcmd("TYPE I")
 
             with self.ftps_session.transfercmd(f"STOR {dest}", rest) as conn:
                 while 1:
@@ -151,7 +186,9 @@ class IoTFTPSClient:
                         callback(buf)
 
                 # shutdown ssl layer
-                if ftplib._SSLSocket is not None and isinstance(conn, ftplib._SSLSocket):
+                if ftplib._SSLSocket is not None and isinstance(
+                    conn, ftplib._SSLSocket
+                ):
                     # Yeah this is suposed to be conn.unwrap
                     # But since we operate in prot p mode
                     # we can close the connection always.
@@ -171,52 +208,91 @@ class IoTFTPSClient:
         """delete a file from under a path inside the FTPS server"""
         self.ftps_session.delete(path)
 
+    def delete_folder(self, path: str):
+        """delete a folder inside the FTPS server"""
+        self.ftps_session.rmd(path)
+
     def move_file(self, source: str, dest: str):
         """move a file inside the FTPS server to another path inside the FTPS server"""
         self.ftps_session.rename(source, dest)
 
     def mkdir(self, path: str) -> str:
         return self.ftps_session.mkd(path)
-    
+
     def fexists(self, path: str) -> bool:
         size = 0
         try:
             size = self.ftps_session.size(path)
-        except:
+        except Exception:
             size = 0
         return size > 0
 
-    def list_files(
-            self, path: str = "/"
-    ) -> None:
+    def list_files(self, path: str = "/") -> None:
         """list files under a path inside the FTPS server"""
         return self.ftps_session.dir(path, print)
 
-    def list_files_ex(self, path: str) -> Union[list[str], None]:
+    def list_files_ex(self, path: str) -> list[FtpListItem] | None:
         """list files under a path inside the FTPS server"""
         try:
-            f = io.StringIO()
-            with redirect_stdout(f):
-                self.ftps_session.dir(path)
-            s = f.getvalue()
-            files = []
-            for row in s.split("\n"):
-                if len(row) <= 0: continue
+            lines: list[str] = []
+            self.ftps_session.dir(path, lines.append)
+            s = "\n".join(lines)
+        except ftplib.error_perm:
+            # no permission for this path
+            return []
+        except Exception:
+            logger.exception("Unexpected exception occurred while fetching file list")
+            return []
 
-                attribs = row.split(" ")
+        files = []
+        for row in s.split("\n"):
+            try:
+                if len(row) <= 0:
+                    continue
 
-                match = re.search(r".*\ (\d\d\:\d\d|\d\d\d\d)\ (.*)", row)
-                name = ""
-                if match:
-                    name = match.groups(1)[1]
-                else:
-                    name = attribs[len(attribs) - 1]
+                match = FTP_LIST_PATTERN.fullmatch(row)
+                if not match:
+                    continue
 
-                file = ( attribs[0], name )
-                files.append(file)
-            return files
-        except Exception as ex:
-            print(f"unexpected exception occurred: [{ex}]")
-            pass
-        return    
-    
+                month = MONTH_LOOKUP.get(match.group("month"))
+                if month is None:
+                    # invalid month
+                    continue
+
+                if match.group("year"):  # "Nov 11 2025"
+                    date = datetime.datetime(
+                        int(match.group("year")), month, int(match.group("day"))
+                    )
+                else:  # "Nov 11 18:19"
+                    today = datetime.datetime.today().astimezone(datetime.timezone.utc)
+                    date = datetime.datetime(
+                        today.year,
+                        month,
+                        int(match.group("day")),
+                        hour=int(match.group("hour")),
+                        minute=int(match.group("minute")),
+                        tzinfo=datetime.timezone.utc,
+                    )
+                    if date > today:
+                        date = (date + datetime.timedelta(days=-365))
+
+                prefix = "" if path == "/" else path
+                name = match.group("name")
+                size = int(match.group("size"))
+
+                files.append(
+                    FtpListItem(
+                        path=f"{prefix}/{name}",
+                        name=name,
+                        size=size,
+                        is_dir=match.group("directory") == "d",
+                        timestamp=date,
+                        owner=match.group("owner"),
+                        group=match.group("group"),
+                        permissions=match.group("permissions"),
+                    )
+                )
+            except Exception:
+                logger.exception(f"Unexpected error while parsing listing row: {row}")
+
+        return files

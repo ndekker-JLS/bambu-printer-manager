@@ -1,12 +1,7 @@
 # See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
 
-# dependencies
-/node_modules
-/.pnp
-.pnp.js
-
 # testing
-/coverage
+/tests
 
 # production
 /build
@@ -19,7 +14,9 @@
 .env.production.local
 ._*
 BambuPrinter.log.*
-
+/node_modules
+/.pnp
+.pnp.js
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
@@ -32,6 +29,13 @@ __pycache__
 # project specific
 *.egg-info
 /dist
+/.vscode
 
-#mkdocs
+# Ruff stuff:
+.ruff_cache/
+
+#mkdocs and swagger docs
 /site
+.github/copilot-instructions.md
+.tmp_*
+CLAUDE.md
